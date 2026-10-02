@@ -31,6 +31,7 @@ pub const IteratorUnsafe = result.IteratorUnsafe;
 pub const QueryRow = result.QueryRow;
 pub const QueryRowUnsafe = result.QueryRowUnsafe;
 pub const Mapper = result.Mapper;
+pub const PgzCell = result.PgzCell;
 
 const reader = @import("reader.zig");
 pub const Reader = reader.Reader;

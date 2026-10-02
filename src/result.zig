@@ -284,6 +284,12 @@ pub const GetError = lib.TypeError || Allocator.Error || error{
     AllocatorRequiredForSliceMapping,
 };
 
+const ToOpts = struct {
+    dupe: bool = false,
+    map: ColumnMapping = .ordinal,
+    allocator: ?Allocator = null,
+};
+
 pub const Row = RowT(.safe);
 pub const RowUnsafe = RowT(.unsafe);
 
@@ -353,14 +359,7 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
                             .oid = oid,
                             .allocator = opts.allocator,
                         };
-                        return T.fromPgzValue(cell) catch |err| {
-                            if (comptime fail_mode == .safe) {
-                                return err;
-                            }
-                            std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
-                        };
-                    } else if (comptime @hasDecl(T, "fromPgzRow")) {
-                        return T.fromPgzRow(value, oid) catch |err| {
+                        return T.fromPgzCell(cell) catch |err| {
                             if (comptime fail_mode == .safe) {
                                 return err;
                             }
@@ -380,22 +379,15 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
         }
 
         pub fn iterator(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
-            const value = self.values[col];
-            if (value.is_null) {
-                return IteratorT(fail_mode, T).asNull();
-            }
-            return IteratorT(fail_mode, T).fromPgzRow(value, self.oids[col]) catch |err| {
-                if (comptime fail_mode == .safe) {
-                    return err;
-                }
-                @panic("Could not get iterator of type " ++ @typeName(T) ++ " for row.");
-            };
+            return self.getOpts(IteratorT(fail_mode, T), .{ .column = .{ .ordinal = col } });
         }
 
         pub fn iteratorCol(self: *const Self, comptime T: type, name: []const u8) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
-            const col = self._result.columnIndex(name);
-            try lib.verifyColumnName(fail_mode, name, col != null);
-            return self.iterator(T, col.?);
+            return self.getOpts(IteratorT(fail_mode, T), .{ .column = .{ .name = name } });
+        }
+
+        pub fn iteratorOpts(self: *const Self, comptime T: type, opts: GetOpts) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
+            return self.getOpts(IteratorT(fail_mode, T), opts);
         }
 
         pub fn record(self: *const Self, col: usize) RecordT(fail_mode) {
@@ -412,12 +404,6 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             try lib.verifyColumnName(fail_mode, name, col != null);
             return self.record(col);
         }
-
-        const ToOpts = struct {
-            dupe: bool = false,
-            map: ColumnMapping = .ordinal,
-            allocator: ?Allocator = null,
-        };
 
         pub fn to(self: *const Self, T: type, opts: ToOpts) !T {
             // if we're given an allocator, use that.
@@ -560,6 +546,10 @@ pub fn QueryRowT(comptime fail_mode: lib.FailMode) type {
             return self.row.iteratorCol(T, name);
         }
 
+        pub fn iteratorOpts(self: *const Self, comptime T: type, opts: GetOpts) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
+            return self.row.iteratorOpts(T, opts);
+        }
+
         pub fn record(self: *const Self, col: usize) RecordT(fail_mode) {
             return self.row.record(col);
         }
@@ -568,7 +558,7 @@ pub fn QueryRowT(comptime fail_mode: lib.FailMode) type {
             return self.row.recordCol(name);
         }
 
-        pub fn to(self: *const Self, T: type, opts: RowT(fail_mode).ToOpts) !T {
+        pub fn to(self: *const Self, T: type, opts: ToOpts) !T {
             return self.row.to(T, opts);
         }
 
@@ -621,13 +611,17 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             };
         }
 
-        // used internally by row.get(Iterator(T))
-        fn fromPgzRow(value: Result.State.Value, oid: i32) !Self {
+        /// Custom PostgreSQL array decoding
+        fn fromPgzCell(cell: PgzCell) !Self {
+            const value = cell.value;
+            if (value.is_null) return asNull();
+
             const data = value.data;
             const TT = switch (@typeInfo(T)) {
                 .optional => |opt| opt.child,
                 else => T,
             };
+            const oid = cell.oid;
 
             const decoder = switch (TT) {
                 u8 => blk: {
