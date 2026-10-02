@@ -18,10 +18,8 @@ pub const Cidr = struct {
     };
 
     pub fn decode(comptime fail_mode: lib.FailMode, data: []const u8, data_oid: i32) if (fail_mode == .unsafe) Cidr else lib.TypeError!Cidr {
-        lib.verifyDecodeType(fail_mode, Cidr, &.{ Cidr.oid.decimal, Cidr.inet_oid.decimal }, data_oid) catch |err| {
-            if (fail_mode == .unsafe) unreachable;
-            return err;
-        };
+        const result = lib.verifyDecodeType(fail_mode, Cidr, &.{ Cidr.oid.decimal, Cidr.inet_oid.decimal }, data_oid);
+        if (comptime fail_mode == .safe) try result;
 
         lib.assert(data.len == 8 or data.len == 20);
         return decodeKnown(data);

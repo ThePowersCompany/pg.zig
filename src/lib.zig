@@ -62,12 +62,17 @@ pub fn assert(ok: bool) void {
     }
 }
 
-pub fn verifyDecodeType(comptime fail_mode: FailMode, comptime T: type, comptime expected_oids: []const i32, actual: i32) !void {
+pub fn verifyDecodeType(
+    comptime fail_mode: FailMode,
+    comptime T: type,
+    comptime expected_oids: []const i32,
+    actual: i32,
+) if (fail_mode == .safe) TypeError!void else void {
     if (comptime fail_mode == .safe) {
         if (isExpectedId(expected_oids, actual)) {
             return;
         }
-        return error.InvalidType;
+        return TypeError.InvalidType;
     }
 
     if (comptime _assert == false) {
@@ -92,12 +97,12 @@ fn isExpectedId(comptime expected_oids: []const i32, actual: i32) bool {
     return false;
 }
 
-pub fn verifyNotNull(comptime fail_mode: FailMode, comptime T: type, is_null: bool) !void {
+pub fn verifyNotNull(comptime fail_mode: FailMode, comptime T: type, is_null: bool) if (fail_mode == .safe) TypeError!void else void {
     if (comptime fail_mode == .safe) {
         if (is_null == false) {
             return;
         }
-        return error.UnexpectedNull;
+        return TypeError.UnexpectedNull;
     }
 
     if (comptime _assert == false) {
@@ -113,12 +118,12 @@ pub fn verifyNotNull(comptime fail_mode: FailMode, comptime T: type, is_null: bo
     unreachable;
 }
 
-pub fn verifyColumnName(comptime fail_mode: FailMode, name: []const u8, valid: bool) !void {
+pub fn verifyColumnName(comptime fail_mode: FailMode, name: []const u8, valid: bool) if (fail_mode == .safe) TypeError!void else void {
     if (comptime fail_mode == .safe) {
         if (valid) {
             return;
         }
-        return error.UnknownColumnName;
+        return TypeError.UnknownColumnName;
     }
 
     if (comptime _assert == false) {

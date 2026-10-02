@@ -249,6 +249,41 @@ pub const Result = struct {
     };
 };
 
+/// Data object passed to the `fromPgzCell` function to support custom PG types.
+pub const PgzCell = struct {
+    value: Result.State.Value,
+    oid: i32,
+
+    /// Optional allocator if the custom type requires allocation.
+    /// If the type requires allocation and this isn't provided at runtime, then the deserialization will fail.
+    allocator: ?Allocator = null,
+};
+
+const ColumnMapping = enum {
+    name,
+    ordinal,
+};
+
+const GetOpts = struct {
+    column: ColumnKey,
+    allocator: ?Allocator = null,
+
+    const ColumnKey = union(ColumnMapping) {
+        name: []const u8,
+        ordinal: usize,
+    };
+
+    pub fn withColumn(self: @This(), col: usize) @This() {
+        var copy = self;
+        copy.column = .{ .ordinal = col };
+        return copy;
+    }
+};
+
+pub const GetError = lib.TypeError || Allocator.Error || error{
+    AllocatorRequiredForSliceMapping,
+};
+
 pub const Row = RowT(.safe);
 pub const RowUnsafe = RowT(.unsafe);
 
@@ -260,46 +295,88 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         const Self = @This();
 
-        pub fn get(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!T else T {
+        pub fn get(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) GetError!T else T {
+            return self.getOpts(T, .{ .column = .{ .ordinal = col } });
+        }
+
+        pub fn getCol(self: *const Self, comptime T: type, name: []const u8) if (fail_mode == .safe) GetError!T else T {
+            return self.getOpts(T, .{ .column = .{ .name = name } });
+        }
+
+        pub fn getOpts(self: *const Self, comptime T: type, opts: GetOpts) if (fail_mode == .safe) GetError!T else T {
+            const col: usize = switch (opts.column) {
+                .name => |name| col: {
+                    const col = self._result.columnIndex(name);
+                    const result = lib.verifyColumnName(fail_mode, name, col != null);
+                    if (comptime fail_mode == .safe) try result;
+                    break :col col.?;
+                },
+                .ordinal => |o| o,
+            };
+
             const value = self.values[col];
+            const oid = self.oids[col];
+
+            if (comptime isSlice(T)) |S| {
+                const a = opts.allocator orelse {
+                    if (comptime fail_mode == .safe) return GetError.AllocatorRequiredForSliceMapping;
+                    std.debug.panic("An allocator is required when reading a PG array ({s}) into a slice of " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
+                };
+                const slice = blk: {
+                    if (@typeInfo(T) == .optional) {
+                        const it = self.getOpts(?Iterator(S), opts.withColumn(col));
+                        const val = if (comptime fail_mode == .safe) try it else it;
+                        break :blk val orelse return null;
+                    } else {
+                        const it = self.getOpts(Iterator(S), opts.withColumn(col));
+                        break :blk if (comptime fail_mode == .safe) try it else it;
+                    }
+                };
+                return slice.alloc(a) catch |err| {
+                    if (comptime fail_mode == .safe) return err;
+                    std.debug.panic("Allocation failed while reading a PG array ({s}) into a slice of " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
+                };
+            }
+
             const TT = switch (@typeInfo(T)) {
                 .optional => |opt| {
                     if (value.is_null) {
                         return null;
                     }
-                    const val = self.get(opt.child, col);
-                    if (comptime fail_mode == .safe) {
-                        return try val;
-                    }
-                    return val;
+                    const result = self.getOpts(opt.child, opts.withColumn(col));
+                    return if (comptime fail_mode == .safe) try result else result;
                 },
                 .@"struct", .@"union" => blk: {
-                    if (@hasDecl(T, "fromPgzRow") == true) {
-                        return T.fromPgzRow(value, self.oids[col]) catch |err| {
+                    if (comptime @hasDecl(T, "fromPgzCell")) {
+                        const cell: PgzCell = .{
+                            .value = value,
+                            .oid = oid,
+                            .allocator = opts.allocator,
+                        };
+                        return T.fromPgzValue(cell) catch |err| {
                             if (comptime fail_mode == .safe) {
                                 return err;
                             }
-                            std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(self.oids[col])});
+                            std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
+                        };
+                    } else if (comptime @hasDecl(T, "fromPgzRow")) {
+                        return T.fromPgzRow(value, oid) catch |err| {
+                            if (comptime fail_mode == .safe) {
+                                return err;
+                            }
+                            std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
                         };
                     }
                     break :blk T;
                 },
                 else => blk: {
-                    lib.verifyNotNull(fail_mode, T, value.is_null) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyNotNull(fail_mode, T, value.is_null);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk T;
                 },
             };
 
-            return types.decodeScalar(fail_mode, TT, value.data, self.oids[col]);
-        }
-
-        pub fn getCol(self: *const Self, comptime T: type, name: []const u8) if (fail_mode == .safe) lib.TypeError!T else T {
-            const col = self._result.columnIndex(name);
-            try lib.verifyColumnName(fail_mode, name, col != null);
-            return self.get(T, col.?);
+            return types.decodeScalar(fail_mode, TT, value.data, oid);
         }
 
         pub fn iterator(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
@@ -338,13 +415,8 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
         const ToOpts = struct {
             dupe: bool = false,
-            map: Mapping = .ordinal,
+            map: ColumnMapping = .ordinal,
             allocator: ?Allocator = null,
-
-            const Mapping = enum {
-                name,
-                ordinal,
-            };
         };
 
         pub fn to(self: *const Self, T: type, opts: ToOpts) !T {
@@ -360,7 +432,7 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
 
             return switch (opts.map) {
                 .ordinal => self.toUsingOrdinal(T, allocator),
-                .name => return self.toUsingName(T, allocator),
+                .name => self.toUsingName(T, allocator),
             };
         }
 
@@ -386,26 +458,15 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             const T = field.type;
             const column_index = optional_column_index orelse {
                 if (field.default_value_ptr) |dflt| {
-                    return @as(*align(1) const field.type, @ptrCast(dflt)).*;
+                    return @as(*align(1) const T, @ptrCast(dflt)).*;
                 }
                 return error.FieldColumnMismatch;
             };
 
-            if (comptime isSlice(T)) |S| {
-                const slice = blk: {
-                    if (@typeInfo(T) == .optional) {
-                        const it = self.get(?Iterator(S), column_index);
-                        const val = if (comptime fail_mode == .safe) try it else it;
-                        break :blk val orelse return null;
-                    } else {
-                        const it = self.get(Iterator(S), column_index);
-                        break :blk if (comptime fail_mode == .safe) try it else it;
-                    }
-                };
-                return try slice.alloc(allocator orelse return error.AllocatorRequiredForSliceMapping);
-            }
-
-            const value = self.get(field.type, column_index);
+            const value = self.getOpts(T, .{
+                .column = .{ .ordinal = column_index },
+                .allocator = allocator,
+            });
             const a = allocator orelse return value;
             return mapValue(T, if (comptime fail_mode == .safe) try value else value, a);
         }
@@ -479,12 +540,16 @@ pub fn QueryRowT(comptime fail_mode: lib.FailMode) type {
 
         const Self = @This();
 
-        pub fn get(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!T else T {
+        pub fn get(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) GetError!T else T {
             return self.row.get(T, col);
         }
 
-        pub fn getCol(self: *const Self, comptime T: type, name: []const u8) if (fail_mode == .safe) lib.TypeError!T else T {
+        pub fn getCol(self: *const Self, comptime T: type, name: []const u8) if (fail_mode == .safe) GetError!T else T {
             return self.row.getCol(T, name);
+        }
+
+        pub fn getOpts(self: *const Self, comptime T: type, opts: GetOpts) if (fail_mode == .safe) GetError!T else T {
+            return self.row.getOpts(T, opts);
         }
 
         pub fn iterator(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
@@ -502,7 +567,8 @@ pub fn QueryRowT(comptime fail_mode: lib.FailMode) type {
         pub fn recordCol(self: *const Self, name: []const u8) if (fail_mode == .safe) lib.TypeError!Record else RecordUnsafe {
             return self.row.recordCol(name);
         }
-        pub fn to(self: *const Self, T: type, opts: Row.ToOpts) !T {
+
+        pub fn to(self: *const Self, T: type, opts: RowT(fail_mode).ToOpts) !T {
             return self.row.to(T, opts);
         }
 
@@ -565,24 +631,18 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
 
             const decoder = switch (TT) {
                 u8 => blk: {
-                    lib.verifyDecodeType(fail_mode, []u8, &.{types.CharArray.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []u8, &.{types.CharArray.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Char.decodeKnown;
                 },
                 i16 => blk: {
-                    lib.verifyDecodeType(fail_mode, []i16, &.{types.Int16Array.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []i16, &.{types.Int16Array.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Int16.decodeKnown;
                 },
                 i32 => blk: {
-                    lib.verifyDecodeType(fail_mode, []i32, &.{types.Int32Array.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []i32, &.{types.Int32Array.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Int32.decodeKnown;
                 },
                 i64 => switch (oid) {
@@ -592,10 +652,8 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
                     else => std.debug.panic("{d} oid cannot target i64 iterator", .{oid}),
                 },
                 f32 => blk: {
-                    lib.verifyDecodeType(fail_mode, []f32, &.{types.Float32Array.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []f32, &.{types.Float32Array.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Float32.decodeKnown;
                 },
                 f64 => switch (oid) {
@@ -604,10 +662,8 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
                     else => std.debug.panic("{d} oid cannot target f64 iterator", .{oid}),
                 },
                 bool => blk: {
-                    lib.verifyDecodeType(fail_mode, []bool, &.{types.BoolArray.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []bool, &.{types.BoolArray.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Bool.decodeKnown;
                 },
                 []const u8 => switch (oid) {
@@ -619,25 +675,19 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
                     else => &types.Bytea.decodeKnownMutable,
                 },
                 types.Numeric => blk: {
-                    lib.verifyDecodeType(fail_mode, []f64, &.{types.NumericArray.oid.decimal}, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []f64, &.{types.NumericArray.oid.decimal}, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Numeric.decodeKnown;
                 },
                 types.Cidr => blk: {
-                    lib.verifyDecodeType(fail_mode, []types.Cidr, &.{ types.CidrArray.oid.decimal, types.CidrArray.inet_oid.decimal }, oid) catch |err| {
-                        if (comptime fail_mode == .unsafe) unreachable;
-                        return err;
-                    };
+                    const result = lib.verifyDecodeType(fail_mode, []types.Cidr, &.{ types.CidrArray.oid.decimal, types.CidrArray.inet_oid.decimal }, oid);
+                    if (comptime fail_mode == .safe) try result;
                     break :blk &types.Cidr.decodeKnown;
                 },
                 else => switch (@typeInfo(TT)) {
                     .@"enum" => blk: {
-                        lib.verifyDecodeType(fail_mode, []const u8, &.{types.StringArray.oid.decimal}, oid) catch |err| {
-                            if (comptime fail_mode == .unsafe) unreachable;
-                            return err;
-                        };
+                        const result = lib.verifyDecodeType(fail_mode, []const u8, &.{types.StringArray.oid.decimal}, oid);
+                        if (comptime fail_mode == .safe) try result;
                         break :blk &EnumDecoder(TT).decodeKnown;
                     },
                     else => compileHaltGetError(T),
@@ -710,7 +760,7 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             return self._decoder(data[len_end..data_end]);
         }
 
-        pub fn alloc(self: *const Self, allocator: Allocator) ![]T {
+        pub fn alloc(self: *const Self, allocator: Allocator) Allocator.Error![]T {
             const into = try allocator.alloc(T, self._len);
             try self.fillAlloc(true, into, allocator);
             return into;
@@ -720,7 +770,7 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             self.fillAlloc(false, into, undefined) catch unreachable;
         }
 
-        fn fillAlloc(self: *const Self, comptime should_dupe: bool, into: []T, allocator: Allocator) !void {
+        fn fillAlloc(self: *const Self, comptime should_dupe: bool, into: []T, allocator: Allocator) Allocator.Error!void {
             const data = self._data;
             const decoder = self._decoder;
 

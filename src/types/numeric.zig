@@ -98,10 +98,8 @@ pub const Numeric = struct {
     }
 
     pub fn decode(comptime fail_mode: lib.FailMode, data: []const u8, data_oid: i32) if (fail_mode == .unsafe) Numeric else lib.TypeError!Numeric {
-        lib.verifyDecodeType(fail_mode, Numeric, &.{Numeric.oid.decimal}, data_oid) catch |err| {
-            if (fail_mode == .unsafe) unreachable;
-            return err;
-        };
+        const result = lib.verifyDecodeType(fail_mode, Numeric, &.{Numeric.oid.decimal}, data_oid);
+        if (comptime fail_mode == .safe) try result;
 
         lib.assert(data.len >= 8);
         return decodeKnown(data);
