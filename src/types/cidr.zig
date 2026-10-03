@@ -36,4 +36,8 @@ pub const Cidr = struct {
             .family = if (data.len == 20) .v6 else .v4,
         };
     }
+
+    pub fn decodeCell(cell: lib.PgzCell) Cidr {
+        return decodeKnown(cell.value.data);
+    }
 };

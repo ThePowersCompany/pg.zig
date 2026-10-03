@@ -51,6 +51,10 @@ pub const Char = struct {
     pub fn decodeKnown(data: []const u8) u8 {
         return data[0];
     }
+
+    pub fn decodeCell(cell: lib.PgzCell) u8 {
+        return decodeKnown(cell.value.data);
+    }
 };
 
 pub const Int16 = struct {
@@ -77,6 +81,10 @@ pub const Int16 = struct {
     pub fn decodeKnown(data: []const u8) i16 {
         return std.mem.readInt(i16, data[0..2], .big);
     }
+
+    pub fn decodeCell(cell: lib.PgzCell) i16 {
+        return decodeKnown(cell.value.data);
+    }
 };
 
 pub const Int32 = struct {
@@ -102,6 +110,10 @@ pub const Int32 = struct {
 
     pub fn decodeKnown(data: []const u8) i32 {
         return std.mem.readInt(i32, data[0..4], .big);
+    }
+
+    pub fn decodeCell(cell: lib.PgzCell) i32 {
+        return decodeKnown(cell.value.data);
     }
 };
 
@@ -134,6 +146,10 @@ pub const Int64 = struct {
     pub fn decodeKnown(data: []const u8) i64 {
         return std.mem.readInt(i64, data[0..8], .big);
     }
+
+    pub fn decodeCell(cell: lib.PgzCell) i64 {
+        return decodeKnown(cell.value.data);
+    }
 };
 
 pub const Timestamp = struct {
@@ -155,6 +171,10 @@ pub const Timestamp = struct {
 
     pub fn decodeKnown(data: []const u8) i64 {
         return std.mem.readInt(i64, data[0..8], .big) + us_from_epoch_to_y2k;
+    }
+
+    pub fn decodeCell(cell: lib.PgzCell) i64 {
+        return decodeKnown(cell.value.data);
     }
 };
 
@@ -184,6 +204,10 @@ pub const Float32 = struct {
         const n = std.mem.readInt(i32, data[0..4], .big);
         const tmp: *f32 = @ptrCast(@constCast(&n));
         return tmp.*;
+    }
+
+    pub fn decodeCell(cell: lib.PgzCell) f32 {
+        return decodeKnown(cell.value.data);
     }
 };
 
@@ -222,6 +246,10 @@ pub const Float64 = struct {
         const tmp: *f64 = @ptrCast(@constCast(&n));
         return tmp.*;
     }
+
+    pub fn decodeCell(cell: lib.PgzCell) f64 {
+        return decodeKnown(cell.value.data);
+    }
 };
 
 pub const Bool = struct {
@@ -242,6 +270,10 @@ pub const Bool = struct {
 
     pub fn decodeKnown(data: []const u8) bool {
         return data[0] == 1;
+    }
+
+    pub fn decodeCell(cell: lib.PgzCell) bool {
+        return decodeKnown(cell.value.data);
     }
 };
 
@@ -283,9 +315,17 @@ pub const Bytea = struct {
         return data;
     }
 
+    pub fn decodeCell(cell: lib.PgzCell) []const u8 {
+        return decodeKnown(cell.value.data);
+    }
+
     pub fn decodeKnownMutable(data: []const u8) []u8 {
         // we know the underlying []u8 is mutable, it comes from our Reader
         return @constCast(data);
+    }
+
+    pub fn decodeCellMutable(cell: lib.PgzCell) []u8 {
+        return decodeKnownMutable(cell.value.data);
     }
 };
 
@@ -484,9 +524,17 @@ pub const JSONB = struct {
         return data[1..];
     }
 
+    pub fn decodeCell(cell: lib.PgzCell) []const u8 {
+        return decodeKnown(cell.value.data);
+    }
+
     pub fn decodeKnownMutable(data: []const u8) []u8 {
         // we know the underlying []u8 is mutable, it comes from our Reader
         return @constCast(data[1..]);
+    }
+
+    pub fn decodeCellMutable(cell: lib.PgzCell) []u8 {
+        return decodeKnownMutable(cell.value.data);
     }
 };
 
@@ -1552,29 +1600,6 @@ pub fn resultEncoding(oids: []i32, buf: *buffer.Buffer) !void {
     view.writeIntBig(u16, @intCast(oids.len));
     for (oids) |oid| {
         view.write(resultEncodingFor(oid));
-    }
-}
-
-pub fn decodeScalar(comptime fail_mode: lib.FailMode, comptime T: type, data: []const u8, oid: i32) if (fail_mode == .safe) lib.TypeError!T else T {
-    switch (T) {
-        u8 => return Char.decode(fail_mode, data, oid),
-        i16 => return Int16.decode(fail_mode, data, oid),
-        i32 => return Int32.decode(fail_mode, data, oid),
-        i64 => return Int64.decode(fail_mode, data, oid),
-        f32 => return Float32.decode(fail_mode, data, oid),
-        f64 => return Float64.decode(fail_mode, data, oid),
-        bool => return Bool.decode(fail_mode, data, oid),
-        []const u8 => return Bytea.decode(data, oid),
-        []u8 => return @constCast(Bytea.decode(data, oid)),
-        Numeric => return Numeric.decode(fail_mode, data, oid),
-        Cidr => return Cidr.decode(fail_mode, data, oid),
-        else => switch (@typeInfo(T)) {
-            .@"enum" => {
-                const str = Bytea.decode(data, oid);
-                return std.meta.stringToEnum(T, str).?;
-            },
-            else => @compileError("cannot decode value of type " ++ @typeName(T)),
-        },
     }
 }
 

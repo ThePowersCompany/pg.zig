@@ -344,38 +344,11 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
                 };
             }
 
-            const TT = switch (@typeInfo(T)) {
-                .optional => |opt| {
-                    if (value.is_null) {
-                        return null;
-                    }
-                    const result = self.getOpts(opt.child, opts.withColumn(col));
-                    return if (comptime fail_mode == .safe) try result else result;
-                },
-                .@"struct", .@"union" => blk: {
-                    if (comptime @hasDecl(T, "fromPgzCell")) {
-                        const cell: PgzCell = .{
-                            .value = value,
-                            .oid = oid,
-                            .allocator = opts.allocator,
-                        };
-                        return T.fromPgzCell(cell) catch |err| {
-                            if (comptime fail_mode == .safe) {
-                                return err;
-                            }
-                            std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
-                        };
-                    }
-                    break :blk T;
-                },
-                else => blk: {
-                    const result = lib.verifyNotNull(fail_mode, T, value.is_null);
-                    if (comptime fail_mode == .safe) try result;
-                    break :blk T;
-                },
-            };
-
-            return types.decodeScalar(fail_mode, TT, value.data, oid);
+            return decode(T, .{
+                .value = value,
+                .oid = oid,
+                .allocator = opts.allocator,
+            });
         }
 
         pub fn iterator(self: *const Self, comptime T: type, col: usize) if (fail_mode == .safe) lib.TypeError!Iterator(T) else IteratorUnsafe(T) {
@@ -455,6 +428,55 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             });
             const a = allocator orelse return value;
             return mapValue(T, if (comptime fail_mode == .safe) try value else value, a);
+        }
+
+        fn decode(comptime T: type, cell: PgzCell) if (fail_mode == .safe) GetError!T else T {
+            const data = cell.value.data;
+            const oid = cell.oid;
+            return switch (T) {
+                u8 => types.Char.decode(fail_mode, data, oid),
+                i16 => types.Int16.decode(fail_mode, data, oid),
+                i32 => types.Int32.decode(fail_mode, data, oid),
+                i64 => types.Int64.decode(fail_mode, data, oid),
+                f32 => types.Float32.decode(fail_mode, data, oid),
+                f64 => types.Float64.decode(fail_mode, data, oid),
+                bool => types.Bool.decode(fail_mode, data, oid),
+                []const u8 => types.Bytea.decode(data, oid),
+                []u8 => @constCast(types.Bytea.decode(data, oid)),
+                types.Numeric => types.Numeric.decode(fail_mode, data, oid),
+                types.Cidr => types.Cidr.decode(fail_mode, data, oid),
+                else => switch (@typeInfo(T)) {
+                    .optional => |opt| {
+                        if (cell.value.is_null) return null;
+                        const result = decode(opt.child, cell);
+                        return if (comptime fail_mode == .safe) try result else result;
+                    },
+                    .@"struct", .@"union" => {
+                        if (comptime @hasDecl(T, "fromPgzCell")) {
+                            return T.fromPgzCell(cell) catch |err| {
+                                if (comptime fail_mode == .safe) {
+                                    return err;
+                                }
+                                std.debug.panic("PostgreSQL value of type {s} could not be read into a " ++ @typeName(T) ++ ".", .{types.oidToString(oid)});
+                            };
+                        }
+                        @compileError("cannot decode value of custom type " ++ @typeName(T) ++ ", must implement fromPgzCell");
+                    },
+                    .@"enum" => {
+                        const str = types.Bytea.decode(data, oid);
+                        return std.meta.stringToEnum(T, str).?;
+                    },
+                    else => @compileError("cannot decode value of type " ++ @typeName(T)),
+                },
+            };
+
+            // const TT = switch (@typeInfo(T)) {
+            //     else => blk: {
+            //         const result = lib.verifyNotNull(fail_mode, T, value.is_null);
+            //         if (comptime fail_mode == .safe) try result;
+            //         break :blk T;
+            //     },
+            // };
         }
     };
 }
@@ -578,11 +600,11 @@ pub fn IteratorUnsafe(comptime T: type) type {
 }
 pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
     return struct {
-        is_null: bool,
-        _len: usize,
-        _pos: usize,
-        _data: []const u8,
-        _decoder: *const fn (data: []const u8) ItemType(),
+        /// Total number of items in the PG array
+        _count: usize,
+
+        _cell: PgzCell,
+        _decoder: *const fn (cell: PgzCell) ItemType(),
 
         fn ItemType() type {
             return switch (@typeInfo(T)) {
@@ -593,108 +615,109 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
 
         const Self = @This();
 
-        pub fn len(self: Self) usize {
-            return self._len;
+        pub fn isNull(self: *const Self) bool {
+            return self._cell.value.is_null;
         }
 
-        fn asNull() Self {
-            return .{
-                .is_null = true,
-                ._len = 0,
-                ._pos = 0,
-                ._data = &.{},
-                ._decoder = struct {
-                    fn noop(_: []const u8) ItemType() {
-                        unreachable;
-                    }
-                }.noop,
-            };
+        pub fn len(self: *const Self) usize {
+            return self._count;
         }
 
         /// Custom PostgreSQL array decoding
-        fn fromPgzCell(cell: PgzCell) !Self {
-            const value = cell.value;
-            if (value.is_null) return asNull();
+        fn fromPgzCell(_cell: PgzCell) !Self {
+            var cell = _cell;
 
-            const data = value.data;
+            const value = cell.value;
+            if (value.is_null) {
+                cell.value.data = "";
+                return .{
+                    ._count = 0,
+                    ._cell = cell,
+                    ._decoder = struct {
+                        fn noop(_: PgzCell) ItemType() {
+                            unreachable;
+                        }
+                    }.noop,
+                };
+            }
+
             const TT = switch (@typeInfo(T)) {
                 .optional => |opt| opt.child,
                 else => T,
             };
             const oid = cell.oid;
-
             const decoder = switch (TT) {
                 u8 => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []u8, &.{types.CharArray.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Char.decodeKnown;
+                    break :blk &types.Char.decodeCell;
                 },
                 i16 => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []i16, &.{types.Int16Array.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Int16.decodeKnown;
+                    break :blk &types.Int16.decodeCell;
                 },
                 i32 => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []i32, &.{types.Int32Array.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Int32.decodeKnown;
+                    break :blk &types.Int32.decodeCell;
                 },
                 i64 => switch (oid) {
-                    types.TimestampArray.oid.decimal => &types.Timestamp.decodeKnown,
-                    types.TimestampTzArray.oid.decimal => &types.Timestamp.decodeKnown,
-                    types.Int64Array.oid.decimal => &types.Int64.decodeKnown,
+                    types.TimestampArray.oid.decimal => &types.Timestamp.decodeCell,
+                    types.TimestampTzArray.oid.decimal => &types.Timestamp.decodeCell,
+                    types.Int64Array.oid.decimal => &types.Int64.decodeCell,
                     else => std.debug.panic("{d} oid cannot target i64 iterator", .{oid}),
                 },
                 f32 => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []f32, &.{types.Float32Array.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Float32.decodeKnown;
+                    break :blk &types.Float32.decodeCell;
                 },
                 f64 => switch (oid) {
-                    types.Float64Array.oid.decimal => &types.Float64.decodeKnown,
-                    types.NumericArray.oid.decimal => &types.Numeric.decodeKnownToFloat,
+                    types.Float64Array.oid.decimal => &types.Float64.decodeCell,
+                    types.NumericArray.oid.decimal => &types.Numeric.decodeCellToFloat,
                     else => std.debug.panic("{d} oid cannot target f64 iterator", .{oid}),
                 },
                 bool => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []bool, &.{types.BoolArray.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Bool.decodeKnown;
+                    break :blk &types.Bool.decodeCell;
                 },
                 []const u8 => switch (oid) {
-                    types.JSONBArray.oid.decimal => &types.JSONB.decodeKnown,
-                    else => &types.Bytea.decodeKnown,
+                    types.JSONBArray.oid.decimal => &types.JSONB.decodeCell,
+                    else => &types.Bytea.decodeCell,
                 },
                 []u8 => switch (oid) {
-                    types.JSONBArray.oid.decimal => &types.JSONB.decodeKnownMutable,
-                    else => &types.Bytea.decodeKnownMutable,
+                    types.JSONBArray.oid.decimal => &types.JSONB.decodeCellMutable,
+                    else => &types.Bytea.decodeCellMutable,
                 },
                 types.Numeric => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []f64, &.{types.NumericArray.oid.decimal}, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Numeric.decodeKnown;
+                    break :blk &types.Numeric.decodeCell;
                 },
                 types.Cidr => blk: {
                     const result = lib.verifyDecodeType(fail_mode, []types.Cidr, &.{ types.CidrArray.oid.decimal, types.CidrArray.inet_oid.decimal }, oid);
                     if (comptime fail_mode == .safe) try result;
-                    break :blk &types.Cidr.decodeKnown;
+                    break :blk &types.Cidr.decodeCell;
                 },
                 else => switch (@typeInfo(TT)) {
                     .@"enum" => blk: {
                         const result = lib.verifyDecodeType(fail_mode, []const u8, &.{types.StringArray.oid.decimal}, oid);
                         if (comptime fail_mode == .safe) try result;
-                        break :blk &EnumDecoder(TT).decodeKnown;
+                        break :blk &EnumDecoder(TT).decodeCell;
                     },
                     else => compileHaltGetError(T),
                 },
             };
 
+            const data = value.data;
             if (data.len == 12) {
                 // we have an empty array
+                cell.value.data = "";
                 return .{
-                    .is_null = false,
-                    ._len = 0,
-                    ._pos = 0,
-                    ._data = &[_]u8{},
+                    ._count = 0,
+                    ._cell = cell,
                     ._decoder = decoder,
                 };
             }
@@ -711,51 +734,43 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             const l = std.mem.readInt(i32, data[12..16][0..4], .big);
             // const lower_bound = std.mem.readInt(i32, data[16..20][0..4], .big);
 
+            cell.value.data = data[20..];
             return .{
-                .is_null = false,
-                ._len = @intCast(l),
-                ._pos = 0,
-                ._data = data[20..],
+                ._count = @intCast(l),
+                ._cell = cell,
                 ._decoder = decoder,
             };
         }
 
         pub fn pgzMoveOwner(self: Self, allocator: Allocator) !Self {
-            return .{
-                .is_null = false,
-                ._len = self._len,
-                ._pos = self._pos,
-                ._data = try allocator.dupe(u8, self._data),
-                ._decoder = self._decoder,
-            };
+            var copy = self;
+            copy._cell.value.data = try allocator.dupe(u8, self._cell.value.data);
+            return copy;
         }
 
         // Should only be called if the Iterator was created with row.to(...)
         // or a result mapper AND an explicit allocator was given
         pub fn deinit(self: *const Self, allocator: Allocator) void {
-            allocator.free(self._data);
+            allocator.free(self._cell.value.data);
         }
 
         pub fn next(self: *Self) ?T {
-            const pos = self._pos;
-            const data = self._data;
-            if (pos == data.len) {
-                return null;
-            }
+            if (self._cell.value.data.len == 0) return null;
 
             // TODO: for fixed length types, we don't need to decode the length
-            const len_end = pos + 4;
-            const value_len = std.mem.readInt(i32, data[pos..len_end][0..4], .big);
+            const value_len: usize = @intCast(std.mem.readInt(i32, self._cell.value.data[0..4], .big));
+            self._cell.value.data = self._cell.value.data[4..];
+            lib.assert(self._cell.value.data.len >= value_len);
 
-            const data_end = len_end + @as(usize, @intCast(value_len));
-            lib.assert(data.len >= data_end);
-
-            self._pos = data_end;
-            return self._decoder(data[len_end..data_end]);
+            const save = self._cell.value.data;
+            self._cell.value.data = save[0..value_len];
+            const result = self._decoder(self._cell);
+            self._cell.value.data = save[value_len..];
+            return result;
         }
 
         pub fn alloc(self: *const Self, allocator: Allocator) Allocator.Error![]T {
-            const into = try allocator.alloc(T, self._len);
+            const into = try allocator.alloc(T, self._count);
             try self.fillAlloc(true, into, allocator);
             return into;
         }
@@ -765,26 +780,27 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
         }
 
         fn fillAlloc(self: *const Self, comptime should_dupe: bool, into: []T, allocator: Allocator) Allocator.Error!void {
-            const data = self._data;
-            const decoder = self._decoder;
+            var cell = self._cell;
 
-            var pos: usize = 0;
-            const limit = @min(into.len, self._len);
+            const limit = @min(into.len, self._count);
             for (0..limit) |i| {
                 // TODO: for fixed length types, we don't need to decode the length
-                const len_end = pos + 4;
-                const data_len = std.mem.readInt(i32, data[pos..len_end][0..4], .big);
+                const data_len = std.mem.readInt(i32, cell.value.data[0..4], .big);
+                cell.value.data = cell.value.data[4..];
 
                 if ((comptime @typeInfo(T) == .optional) and data_len == -1) {
-                    pos = len_end;
                     into[i] = null;
                 } else {
-                    pos = len_end + @as(usize, @intCast(data_len));
+                    const save = cell.value.data;
+                    const l: usize = @intCast(data_len);
+                    cell.value.data = save[0..l];
+                    const result = self._decoder(cell);
                     if (comptime should_dupe and (T == []u8 or T == []const u8)) {
-                        into[i] = try allocator.dupe(u8, decoder(data[len_end..pos]));
+                        into[i] = try allocator.dupe(u8, result);
                     } else {
-                        into[i] = decoder(data[len_end..pos]);
+                        into[i] = result;
                     }
+                    cell.value.data = save[l..];
                 }
             }
         }
@@ -795,6 +811,9 @@ fn EnumDecoder(comptime T: type) type {
     return struct {
         pub fn decodeKnown(data: []const u8) T {
             return std.meta.stringToEnum(T, data).?;
+        }
+        pub fn decodeCell(cell: lib.PgzCell) T {
+            return decodeKnown(cell.value.data);
         }
     };
 }
@@ -839,7 +858,11 @@ pub fn RecordT(comptime fail_mode: lib.FailMode) type {
             self.data = data[end..];
 
             // start at 4 to skip the length which we already read
-            return types.decodeScalar(fail_mode, TT, data[4..end], oid);
+            return RowT(fail_mode).decode(TT, .{
+                .value = .{ .data = data[4..end], .is_null = false },
+                .oid = oid,
+                .allocator = null, // Note: `Record` cannot be used for decode arrays or types that require allocation
+            });
         }
     };
 }
@@ -1196,7 +1219,7 @@ test "Result: null iterator" {
         var row = (try result.nextUnsafe()).?;
 
         var iterator = row.iterator(i32, 0);
-        try t.expectEqual(true, iterator.is_null);
+        try t.expectEqual(true, iterator.isNull());
         try t.expectEqual(null, iterator.next());
         try result.drain();
     }
@@ -1209,7 +1232,7 @@ test "Result: null iterator" {
         var row = (try result.nextUnsafe()).?;
 
         var iterator = row.iterator([]u8, 0);
-        try t.expectEqual(true, iterator.is_null);
+        try t.expectEqual(true, iterator.isNull());
         try t.expectEqual(null, iterator.next());
         try result.drain();
     }

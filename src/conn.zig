@@ -1250,52 +1250,52 @@ test "PG: null support" {
 
     const row = (try result.nextUnsafe()) orelse unreachable;
     try t.expectEqual(null, row.get(?i16, 1));
-    try t.expectEqual(true, row.iterator(i16, 2).is_null);
+    try t.expectEqual(true, row.iterator(i16, 2).isNull());
 
     try t.expectEqual(null, row.get(?i32, 3));
-    try t.expectEqual(true, row.iterator(i32, 4).is_null);
+    try t.expectEqual(true, row.iterator(i32, 4).isNull());
 
     try t.expectEqual(null, row.get(?i64, 5));
-    try t.expectEqual(true, row.iterator(i64, 6).is_null);
+    try t.expectEqual(true, row.iterator(i64, 6).isNull());
 
     try t.expectEqual(null, row.get(?f32, 7));
-    try t.expectEqual(true, row.iterator(f32, 8).is_null);
+    try t.expectEqual(true, row.iterator(f32, 8).isNull());
 
     try t.expectEqual(null, row.get(?f64, 9));
-    try t.expectEqual(true, row.iterator(f64, 10).is_null);
+    try t.expectEqual(true, row.iterator(f64, 10).isNull());
 
     try t.expectEqual(null, row.get(?bool, 11));
-    try t.expectEqual(true, row.iterator(bool, 12).is_null);
+    try t.expectEqual(true, row.iterator(bool, 12).isNull());
 
     try t.expectEqual(null, row.get(?[]u8, 13));
-    try t.expectEqual(true, row.iterator([]u8, 14).is_null);
+    try t.expectEqual(true, row.iterator([]u8, 14).isNull());
 
     try t.expectEqual(null, row.get(?[]const u8, 15));
-    try t.expectEqual(true, row.iterator([]const u8, 16).is_null);
+    try t.expectEqual(true, row.iterator([]const u8, 16).isNull());
 
     try t.expectEqual(null, row.get(?[]const u8, 17));
-    try t.expectEqual(true, row.iterator([]const u8, 18).is_null);
+    try t.expectEqual(true, row.iterator([]const u8, 18).isNull());
 
     try t.expectEqual(null, row.get(?[]u8, 19));
-    try t.expectEqual(true, row.iterator([]const u8, 20).is_null);
+    try t.expectEqual(true, row.iterator([]const u8, 20).isNull());
 
     try t.expectEqual(null, row.get(?[]u8, 21));
     try t.expectEqual(null, row.get(?f64, 21));
 
     try t.expectEqual(null, row.get(?i64, 23));
-    try t.expectEqual(true, row.iterator(i64, 24).is_null);
+    try t.expectEqual(true, row.iterator(i64, 24).isNull());
 
     try t.expectEqual(null, row.get(?[]u8, 25));
-    try t.expectEqual(true, row.iterator([]const u8, 26).is_null);
+    try t.expectEqual(true, row.iterator([]const u8, 26).isNull());
 
     try t.expectEqual(null, row.get(?[]u8, 27));
-    try t.expectEqual(true, row.iterator([]const u8, 28).is_null);
+    try t.expectEqual(true, row.iterator([]const u8, 28).isNull());
 
     try t.expectEqual(null, row.get(?u8, 29));
-    try t.expectEqual(true, row.iterator(u8, 30).is_null);
+    try t.expectEqual(true, row.iterator(u8, 30).isNull());
 
     try t.expectEqual(null, row.get(?u8, 31));
-    try t.expectEqual(true, row.iterator(u8, 32).is_null);
+    try t.expectEqual(true, row.iterator(u8, 32).isNull());
 
     try t.expectEqual(null, try result.next());
 }
